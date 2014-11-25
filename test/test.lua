@@ -2450,6 +2450,54 @@ function cunntest.Exp_backward()
    mytester:assertlt(error:abs():max(), precision_backward, 'error on state (backward) ')
 end
 
+function cunntest.Dropout()
+   local p = 0.2 --prob of droping out a neuron
+   local input = torch.CudaTensor(1000):fill((1-p))
+   local module = nn.Dropout(p)
+   module:cuda()
+   -- version 2
+   local output = module:forward(input)
+   mytester:assert(math.abs(output:mean() - (1-p)) < 0.05, 'dropout output')
+   local gradInput = module:backward(input, input)
+   mytester:assert(math.abs(gradInput:mean() - (1-p)) < 0.05, 'dropout gradInput')
+   -- version 1 (old nnx version)
+   local input = input:fill(1)
+   local module = nn.Dropout(p,true)
+   module:cuda()
+   local output = module:forward(input)
+   mytester:assert(math.abs(output:mean() - (1-p)) < 0.05, 'dropout output')
+   local gradInput = module:backward(input, input)
+   mytester:assert(math.abs(gradInput:mean() - (1-p)) < 0.05, 'dropout gradInput')
+end
+
+function cunntest.Dropout_forward()
+   local size = math.random(1,200)
+
+   local tm = {}
+   local title = string.format('Dropout forward %d -> %d', size, size)
+   times[title] = tm
+
+   local input = torch.randn(size)
+   local sconv = nn.Dropout()
+   local groundtruth = sconv:forward(input)
+   local a = torch.Timer()
+   for i = 1,nloop do
+      groundtruth = sconv:forward(input)
+   end
+   tm.cpu = a:time().real
+
+   input = input:cuda()
+   local gconv = nn.Dropout():cuda()
+   local rescuda = gconv:forward(input)
+   a:reset()
+   for i = 1,nloop do
+      rescuda = gconv:forward(input)
+   end
+   cutorch.synchronize()
+   tm.gpu = a:time().real
+
+end
+
 function cunntest.SoftPlus_forward()
    local size = math.random(1,100)
 
@@ -2672,7 +2720,96 @@ function cunntest.SpatialUpSamplingNearest_backward_batch()
    mytester:assertlt(error:abs():max(), precision_backward, 'error on state (backward) ')
 end
 
-function nn.testcuda(tests)
+function cunntest.l1cost()
+   local size = math.random(300,500)
+   local input = torch.randn(size)
+   local mod = nn.L1Cost()
+
+   local tm = {}
+   local title = string.format('L1Cost %d ',size)
+   times[title] = tm
+
+   local a = torch.Timer()
+   local fout = mod:forward(input)
+   local fgin = mod:backward(input):clone()
+   tm.cpu = a:time().real
+
+   local cinput = input:cuda()
+   local cmod = nn.L1Cost():cuda()
+   a:reset()
+   local cout = cmod:forward(cinput)
+   local cgin = cmod:backward(cinput)
+   cutorch.synchronize()
+   tm.gpu = a:time().real
+
+   mytester:assertlt(math.abs(fout-cout), precision_forward, 'error  on output')
+   local gerr = cgin:float() - fgin
+   mytester:assertlt(gerr:abs():max(), precision_forward, 'error  on gradInput')
+end
+
+
+function cunntest.ClassNLLCriterionSingleTarget()
+   local size = math.random(3000,5000)
+   local input = torch.randn(size)
+   local target = 1
+   local mod = nn.ClassNLLCriterion()
+
+   local tm = {}
+   local title = string.format('ClassNLLCriterionSingleTarget %d ',size)
+   times[title] = tm
+
+   local a = torch.Timer()
+   local fout = mod:forward(input, target)
+   local fgin = mod:backward(input, target):clone()
+   tm.cpu = a:time().real
+
+   local cinput = input:cuda()
+   local ctarget = torch.CudaTensor(1):fill(target)
+   local cmod = nn.ClassNLLCriterion():cuda()
+   a:reset()
+   local cout = cmod:forward(cinput,ctarget)
+   local cgin = cmod:backward(cinput,ctarget)
+   cutorch.synchronize()
+   tm.gpu = a:time().real
+
+   mytester:assertlt(
+       math.abs(fout-cout), precision_forward, 'error  on output')
+   local gerr = cgin:float() - fgin
+   mytester:assertlt(gerr:abs():max(), precision_forward, 'error  on gradInput')
+end
+
+function cunntest.ClassNLLCriterionMultipleTarget()
+   local size = math.random(3000,5000)
+   local input = torch.randn(size, size)
+   local target = torch.randperm(size)
+   local mod = nn.ClassNLLCriterion()
+
+   local tm = {}
+   local title = string.format('ClassNLLCriterionMultiTarget %d ',size)
+   times[title] = tm
+
+   local a = torch.Timer()
+   local fout = mod:forward(input, target)
+   local fgin = mod:backward(input, target):clone()
+   tm.cpu = a:time().real
+
+   local cinput = input:cuda()
+   local ctarget = target:cuda()
+   local cmod = nn.ClassNLLCriterion():cuda()
+   a:reset()
+   local cout = cmod:forward(cinput,ctarget)
+   local cgin = cmod:backward(cinput,ctarget)
+   cutorch.synchronize()
+   tm.gpu = a:time().real
+
+   mytester:assertlt(
+       math.abs(fout-cout), precision_forward, 'error on output')
+
+   local gerr = cgin:float() - fgin
+   mytester:assertlt(gerr:abs():max(), precision_forward, 'error  on gradInput')
+end
+
+function nn.testcuda(tests, print_timing)
    local oldtype = torch.getdefaulttensortype()
    torch.setdefaulttensortype('torch.FloatTensor')
    math.randomseed(os.time())
@@ -2680,13 +2817,15 @@ function nn.testcuda(tests)
    mytester:add(cunntest)
    mytester:run(tests)
    torch.setdefaulttensortype(oldtype)
-   print ''
-   print ' ------------------------------------------------------------------------------------------------'
-   print '|  Module                                                                          |  Speedup    |'
-   print ' ------------------------------------------------------------------------------------------------'
-   for module,tm in pairs(times) do
-      local str = string.format('| %-80s | %4.2f        |', module, (tm.cpu / (tm.gpu or 1e6)))
-      print(str)
+   if print_timing then
+       print ''
+       print ' ------------------------------------------------------------------------------------------------'
+       print '|  Module                                                                          |  Speedup    |'
+       print ' ------------------------------------------------------------------------------------------------'
+       for module,tm in pairs(times) do
+           local str = string.format('| %-80s | %4.2f        |', module, (tm.cpu / (tm.gpu or 1e6)))
+           print(str)
+       end
+       print ' ------------------------------------------------------------------------------------------------'
    end
-   print ' ------------------------------------------------------------------------------------------------'
 end
